@@ -1,0 +1,6 @@
+*.mtx
+*.tar.gz
+*.zip
+/petsc-main/
+/ginkgo-develop/
+
