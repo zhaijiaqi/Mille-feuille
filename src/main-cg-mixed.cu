@@ -1,6 +1,19 @@
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
 #include <cuda_fp16.h>
 #include <sys/time.h>
+
+#define WARMUP 3
+#define BENCHMARK 10
+
+typedef struct {
+    double time_ms;
+    int iterations;
+    double l2_norm;
+    double residual;
+} CgBenchResult;
 #include "csr2block.h"
 #include "blockspmv_cpu.h"
 #include "utils.h"
@@ -138,7 +151,8 @@ __forceinline__ __global__ void stir_spmv_cuda_kernel_newcsr_nnz_balance_redce_b
                                                                                                      float *d_x_f,
                                                                                                      half *d_x_h,
                                                                                                      int8_t *d_x_8,
-                                                                                                     float *d_y_f)
+                                                                                                     float *d_y_f,
+                                                                                                     int max_iter)
 {
     int global_id = blockIdx.x * blockDim.x + threadIdx.x;
     const int blki_blc = global_id >> 5;
@@ -184,8 +198,8 @@ __forceinline__ __global__ void stir_spmv_cuda_kernel_newcsr_nnz_balance_redce_b
         int index_dot;
         int offset = blki_blc * BLOCK_SIZE;
 
-        // for(int iter=1;(iter<=100)&&(k_snew[0]>k_threshold[0]);iter++)
-        for (int iter = 1; (iter <= 100); iter++)
+        // for(int iter=1;(iter<=max_iter)&&(k_snew[0]>k_threshold[0]);iter++)
+        for (int iter = 1; (iter <= max_iter); iter++)
         {
             if (threadIdx.x < WARP_PER_BLOCK)
             {
@@ -511,7 +525,8 @@ __forceinline__ __global__ void stir_spmv_cuda_kernel_newcsr_nnz_balance_redce_b
                                                                                                                   half *d_x_h,
                                                                                                                   int8_t *d_x_8,
                                                                                                                   float *d_y_f,
-                                                                                                                  int shared_num)
+                                                                                                                  int shared_num,
+                                                                                                                  int max_iter)
 {
     int global_id = blockIdx.x * blockDim.x + threadIdx.x;
     const int blki_blc = global_id >> 5;
@@ -587,8 +602,8 @@ __forceinline__ __global__ void stir_spmv_cuda_kernel_newcsr_nnz_balance_redce_b
             }
         }
 
-        // for(int iter=0;(iter<100)&&(k_snew[0]>k_threshold[0]);iter++)
-        for (int iter = 1; (iter <= 100); iter++)
+        // for(int iter=0;(iter<max_iter)&&(k_snew[0]>k_threshold[0]);iter++)
+        for (int iter = 1; (iter <= max_iter); iter++)
         {
             if (threadIdx.x < WARP_PER_BLOCK)
             {
@@ -995,63 +1010,41 @@ __forceinline__ __global__ void stir_spmv_cuda_kernel_newcsr_nnz_balance_redce_b
     }
 }
 
-__forceinline__ __global__ void stir_spmv_cuda_kernel_newcsr_nnz_balance_below_tilem_32_block_reduce_mix_precision(int tilem, int tilenum, int rowA, int colA, int nnzA,
-                                                                                                                   int *d_tile_ptr,
-                                                                                                                   int *d_tile_columnidx,
-                                                                                                                   unsigned char *d_csr_compressedIdx,
-                                                                                                                   double *d_Blockcsr_Val_d,
-                                                                                                                   unsigned char *d_Blockcsr_Ptr,
-                                                                                                                   int *d_ptroffset1,
-                                                                                                                   int *d_ptroffset2,
-                                                                                                                   int rowblkblock,
-                                                                                                                   unsigned int *d_blkcoostylerowidx,
-                                                                                                                   int *d_blkcoostylerowidx_colstart,
-                                                                                                                   int *d_blkcoostylerowidx_colstop,
-                                                                                                                   double *d_x_d,
-                                                                                                                   double *d_y_d,
-                                                                                                                   unsigned char *d_blockrowid_new,
-                                                                                                                   unsigned char *d_blockcsr_ptr_new,
-                                                                                                                   int *d_nonzero_row_new,
-                                                                                                                   unsigned char *d_Tile_csr_Col,
-                                                                                                                   int *d_block_signal,
-                                                                                                                   int *signal_dot,
-                                                                                                                   int *signal_final,
-                                                                                                                   int *signal_final1,
-                                                                                                                   int *d_ori_block_signal,
-                                                                                                                   double *k_alpha,
-                                                                                                                   double *k_snew,
-                                                                                                                   double *k_x,
-                                                                                                                   double *k_r,
-                                                                                                                   double *k_sold,
-                                                                                                                   double *k_beta,
-                                                                                                                   double *k_threshold,
-                                                                                                                   int *d_balance_tile_ptr,
-                                                                                                                   int *d_row_each_block,
-                                                                                                                   int *d_index_each_block,
-                                                                                                                   int balance_row,
-                                                                                                                   int *d_non_each_block_offset,
-                                                                                                                   int vector_each_warp,
-                                                                                                                   int vector_total,
-                                                                                                                   int *d_vis,
-                                                                                                                   double *d_x_d_last,
-                                                                                                                   float *d_Blockcsr_Val_f,
-                                                                                                                   half *d_Blockcsr_Val_h,
-                                                                                                                   int8_t *d_Blockcsr_Val_8,
-                                                                                                                   float *d_x_f,
-                                                                                                                   half *d_x_h,
-                                                                                                                   int8_t *d_x_8,
-                                                                                                                   float *d_y_f)
+// 稀疏 CG 混合精度 SPMV 基于block归约的内核。
+// tilem: tile数量；tilenum: tile种类；rowA, colA, nnzA: 稀疏矩阵相关参数
+// 多精度相关输入向量（double/float/half/int8），以及协调信号与辅助变量...
+__forceinline__ __global__ void
+stir_spmv_cuda_kernel_newcsr_nnz_balance_below_tilem_32_block_reduce_mix_precision(
+    int tilem, int tilenum, int rowA, int colA, int nnzA, int *d_tile_ptr,
+    int *d_tile_columnidx, unsigned char *d_csr_compressedIdx,
+    double *d_Blockcsr_Val_d, unsigned char *d_Blockcsr_Ptr, int *d_ptroffset1,
+    int *d_ptroffset2, int rowblkblock, unsigned int *d_blkcoostylerowidx,
+    int *d_blkcoostylerowidx_colstart, int *d_blkcoostylerowidx_colstop,
+    double *d_x_d, double *d_y_d, unsigned char *d_blockrowid_new,
+    unsigned char *d_blockcsr_ptr_new, int *d_nonzero_row_new,
+    unsigned char *d_Tile_csr_Col, int *d_block_signal, int *signal_dot,
+    int *signal_final, int *signal_final1, int *d_ori_block_signal,
+    double *k_alpha, double *k_snew, double *k_x, double *k_r, double *k_sold,
+    double *k_beta, double *k_threshold, int *d_balance_tile_ptr,
+    int *d_row_each_block, int *d_index_each_block, int balance_row,
+    int *d_non_each_block_offset, int vector_each_warp, int vector_total,
+    int *d_vis, double *d_x_d_last, float *d_Blockcsr_Val_f,
+    half *d_Blockcsr_Val_h, int8_t *d_Blockcsr_Val_8, float *d_x_f, half *d_x_h,
+    int8_t *d_x_8, float *d_y_f,
+    int max_iter)
 {
     int global_id = blockIdx.x * blockDim.x + threadIdx.x;
-    const int blki_blc = global_id >> 5;
-    const int local_warp_id = threadIdx.x >> 5;
+    const int blki_blc = global_id >> 5;    // 当前线程块对应的 tile/block
+    const int local_warp_id = threadIdx.x >> 5; // 当前线程属于block内哪个warp
 
-    const int lane_id = (WARP_SIZE - 1) & threadIdx.x;
+    const int lane_id = (WARP_SIZE - 1) & threadIdx.x; // 线程在线程束(32)里的编号
 
-    __shared__ double s_dot1[WARP_PER_BLOCK * 32];
+    // 用于归约的共享内存
+    __shared__ double s_dot1[WARP_PER_BLOCK * 32];   // 第一阶段归约
     double *s_dot1_val = &s_dot1[local_warp_id * 32];
-    __shared__ double s_dot2[WARP_PER_BLOCK * 32];
+    __shared__ double s_dot2[WARP_PER_BLOCK * 32];   // 第二阶段归约
     double *s_dot2_val = &s_dot2[local_warp_id * 32];
+
     // 同步数组
     __shared__ double s_snew[WARP_PER_BLOCK];
     __shared__ double s_alpha[WARP_PER_BLOCK];
@@ -1059,14 +1052,19 @@ __forceinline__ __global__ void stir_spmv_cuda_kernel_newcsr_nnz_balance_below_t
 
     __shared__ int row_begin[WARP_PER_BLOCK];
     __shared__ int row_end[WARP_PER_BLOCK];
+
+    // 每个warp两个int用于记录混合精度选择
     __shared__ int vis_spmv[WARP_PER_BLOCK * 2];
     int *vis_spmv_val = &vis_spmv[local_warp_id * 2];
 
+    // 主体循环: 只处理balance row范围
     if (blki_blc < balance_row)
     {
+        // 获取该block包含的tile范围
         int rowblkjstart = d_balance_tile_ptr[blki_blc];
         int rowblkjstop = d_balance_tile_ptr[blki_blc + 1];
 
+        // 各数据类型累加和
         double sum_d = 0.0;
         float sum_f = 0.0;
         int8_t sum_8 = 0.0;
@@ -1075,42 +1073,36 @@ __forceinline__ __global__ void stir_spmv_cuda_kernel_newcsr_nnz_balance_below_t
         int blkj;
         int blki;
         int csroffset;
-        int ri = lane_id >> 1;
+        int ri = lane_id >> 1;           // 当前warp线束是第几行
         int virtual_lane_id = lane_id & 0x1;
-        int s1;
-        int s2;
-        int colid;
-        int x_offset;
-        int ro;
-        int rj;
-        int index_s;
-        int csrcol;
-        int index_dot;
-        int offset = blki_blc * vector_each_warp;
-        int iter;
-        int u;
-        int row_end;
+        int s1, s2, colid, x_offset, ro, rj, index_s, csrcol, index_dot;
+        int offset = blki_blc * vector_each_warp;   // 当前block的向量偏移
+        int iter, u, row_end;
 
-        for (iter = 1; (iter <= 100); iter++)
+        for (iter = 1; (iter <= max_iter); iter++)  // 最多100次大循环（CG迭代）
         {
+            // 只由每个warp的前WARP_PER_BLOCK个线程做初始化
             if (threadIdx.x < WARP_PER_BLOCK)
             {
                 s_snew[threadIdx.x] = k_snew[0];
                 s_alpha[threadIdx.x] = 0;
                 s_beta[threadIdx.x] = 0;
             }
+            // 仅warp内前32线程初始化本地归约缓存
             if (lane_id < 32)
             {
                 s_dot1_val[lane_id] = 0.0;
                 s_dot2_val[lane_id] = 0.0;
             }
             __syncthreads();
+            // 前2线程清零混合精度flag数组
             if (lane_id < 2)
             {
                 vis_spmv_val[lane_id] = 0;
             }
             __syncthreads();
             __threadfence();
+            // 由全局线程0初始化信号量和全局数据
             if (global_id == 0)
             {
                 signal_dot[0] = vector_total;
@@ -1118,6 +1110,8 @@ __forceinline__ __global__ void stir_spmv_cuda_kernel_newcsr_nnz_balance_below_t
                 signal_final[0] = 0;
             }
             __threadfence();
+
+            // 处理该block对应tile里的每一个小block
             for (blkj_blc = rowblkjstart; blkj_blc < rowblkjstop; blkj_blc++)
             {
                 blkj = d_index_each_block[blkj_blc];
@@ -1128,9 +1122,11 @@ __forceinline__ __global__ void stir_spmv_cuda_kernel_newcsr_nnz_balance_below_t
                     csroffset = d_ptroffset1[blkj];
                     s1 = d_nonzero_row_new[blkj];
                     s2 = d_nonzero_row_new[blkj + 1];
+                    // 一个warp的每个线程负责block内一行
                     if (ri < s2 - s1)
                     {
-                        ro = d_blockrowid_new[s1 + ri + 1];
+                      ro = d_blockrowid_new[s1 + ri + 1];
+                      // SpMV, 结果存在 d_y_d 中
                         switch (d_vis[colid])
                         {
                         case 0:
@@ -1224,8 +1220,10 @@ __forceinline__ __global__ void stir_spmv_cuda_kernel_newcsr_nnz_balance_below_t
                 }
             }
 
+            // CG解向量与残差归约以及向量更新
             if (blki_blc < vector_total)
             {
+                // 等待所有相关block_signal就绪
                 for (u = 0; u < vector_each_warp * 2; u++)
                 {
                     int off = blki_blc * vector_each_warp * 2;
@@ -1235,11 +1233,13 @@ __forceinline__ __global__ void stir_spmv_cuda_kernel_newcsr_nnz_balance_below_t
                         __threadfence();
                     } while (d_block_signal[(off + u)] != index_dot);
                 }
+                // 计算 inner product s_dot1_val
                 for (u = 0; u < vector_each_warp; u++)
                 {
                     index_dot = (offset + u) * 32 + lane_id;
-                    s_dot1_val[lane_id] += (d_y_d[index_dot] * d_x_d[index_dot]);
+                    s_dot1_val[lane_id] += (d_y_d[index_dot] * d_x_d[index_dot]);   // IP: (mu, p_j)
                 }
+                // warp/block级归约（规约求和）
                 __syncthreads();
                 int i = (32 * WARP_PER_BLOCK) / 2;
                 while (i != 0)
@@ -1251,13 +1251,14 @@ __forceinline__ __global__ void stir_spmv_cuda_kernel_newcsr_nnz_balance_below_t
                     __syncthreads();
                     i /= 2;
                 }
-
+                // warp0线程加到全局alpha
                 if (threadIdx.x == 0)
                 {
                     atomicAdd(k_alpha, s_dot1[0]);
                 }
                 __threadfence();
 
+                // 只由各warp的lane0更新sold/snew信号
                 if ((lane_id == 0))
                 {
                     if (atomicSub(signal_dot, 1) - 1 == 0)
@@ -1266,24 +1267,27 @@ __forceinline__ __global__ void stir_spmv_cuda_kernel_newcsr_nnz_balance_below_t
                         k_snew[0] = 0;
                     }
                 }
-
+                // 等待所有warp归约（即CG归约 barrier）
                 do
                 {
                     __threadfence();
                 } while (signal_dot[0] != 0);
+
+                // 解步长alpha
                 if (lane_id == 0)
                 {
-                    s_alpha[local_warp_id] = s_snew[local_warp_id] / k_alpha[0];
+                    s_alpha[local_warp_id] = s_snew[local_warp_id] / k_alpha[0];    // alpha_j = s_{j+1} / alpha_j = (r_{j+1})^T * r_{j+1} / (p_j)^T * A * p_j
                 }
+                // 正式解k_x与残差k_r更新
                 for (u = 0; u < vector_each_warp; u++)
                 {
                     index_dot = (offset + u) * 32 + lane_id;
-                    k_x[index_dot] = k_x[index_dot] + s_alpha[local_warp_id] * d_x_d[index_dot];
-
-                    k_r[index_dot] = k_r[index_dot] - s_alpha[local_warp_id] * d_y_d[index_dot];
+                    k_x[index_dot] = k_x[index_dot] + s_alpha[local_warp_id] * d_x_d[index_dot];    // x_{j+1} = x_j + alpha_j * p_j
+                    k_r[index_dot] = k_r[index_dot] - s_alpha[local_warp_id] * d_y_d[index_dot];    // r_{j+1} = r_j - alpha_j * mu_j = r_j - alpha_j * A * p_j
                     __threadfence();
-                    s_dot2_val[lane_id] += (k_r[index_dot] * k_r[index_dot]);
+                    s_dot2_val[lane_id] += (k_r[index_dot] * k_r[index_dot]);   // IP: (r_{j+1}, r_{j+1})
                 }
+                // 归约k_snew
                 __syncthreads();
                 i = (32 * WARP_PER_BLOCK) / 2;
                 while (i != 0)
@@ -1304,26 +1308,31 @@ __forceinline__ __global__ void stir_spmv_cuda_kernel_newcsr_nnz_balance_below_t
                 {
                     atomicAdd(signal_dot, 1);
                 }
+                // 再次同步所有CG子进程
                 do
                 {
                     __threadfence();
                 } while (signal_dot[0] != vector_total);
 
+                // 步长beta
                 if (lane_id == 0)
                 {
-                    s_beta[local_warp_id] = k_snew[0] / k_sold[0];
+                    s_beta[local_warp_id] = k_snew[0] / k_sold[0];    // beta_j = s_{j+1} / s_j
                 }
+                // 下一步CG数据准备, online 精度判断
                 for (u = 0; u < vector_each_warp; u++)
                 {
                     index_dot = (offset + u) * 32 + lane_id;
                     double d_x_last = d_x_d[index_dot];
-                    d_x_d[index_dot] = k_r[index_dot] + s_beta[local_warp_id] * d_x_d[index_dot];
+                    // k_x, k_r 更新后，再将其转换为低精度向量表示
+                    d_x_d[index_dot] = k_r[index_dot] + s_beta[local_warp_id] * d_x_d[index_dot];   // p_{j+1} = r_{j+1} + beta_j * p_j, 一轮CG结束，准备下一轮
                     d_y_d[index_dot] = 0.0;
                     d_x_f[index_dot] = (float)(d_x_d[index_dot]);
                     d_x_h[index_dot] = __double2half(d_x_d[index_dot]);
                     d_x_8[index_dot] = (int8_t)(d_x_8[index_dot]);
-                    d_vis[(index_dot / 16)] = 0;
-                    double val = fabs(d_x_d[index_dot] - d_x_last);
+                    d_vis[(index_dot / 16)] = 0;   // 精度分组标记初始化
+                    double val = fabs(d_x_d[index_dot] - d_x_last); // 当前更新幅度
+                    // 根据val（当前向量分量的更新幅度）判断后续应采用哪种精度.  与原文不符，原文是用 val 的值判断的
                     if (val <= 1e-7 && val > 1e-8) // fp8
                     {
                         vis_spmv_val[(lane_id / 16)] = 2;
@@ -1341,33 +1350,32 @@ __forceinline__ __global__ void stir_spmv_cuda_kernel_newcsr_nnz_balance_below_t
                         vis_spmv_val[(lane_id / 16)] = 1; // fp64
                     }
                     __syncthreads();
+                    // 每组第一个线束负责写d_vis
                     if (lane_id % 16 == 0)
                     {
                         switch (vis_spmv_val[lane_id / 16])
                         {
                         case 0:
-                            d_vis[(index_dot / 16)] = 1;
-                            break;
+                            d_vis[(index_dot / 16)] = 1; break;
                         case 2:
-                            d_vis[(index_dot / 16)] = 2;
-                            break;
+                            d_vis[(index_dot / 16)] = 2; break;
                         case 3:
-                            d_vis[(index_dot / 16)] = 3;
-                            break;
+                            d_vis[(index_dot / 16)] = 3; break;
                         case 4:
-                            d_vis[(index_dot / 16)] = 4;
-                            break;
+                            d_vis[(index_dot / 16)] = 4; break;
                         default:
                             break;
                         }
                     }
                     __syncthreads();
                 }
+                // 一个warp的lane0信号+1
                 if (lane_id == 0)
                 {
                     atomicAdd(signal_final, 1);
                 }
             }
+            // 等待所有warp都处理完本轮所有向量
             do
             {
                 __threadfence();
@@ -1423,7 +1431,8 @@ __forceinline__ __global__ void stir_spmv_cuda_kernel_newcsr_nnz_balance_below_t
                                                                                                                                 int8_t *d_x_8,
                                                                                                                                 float *d_y_f,
                                                                                                                                 int *d_balance_tile_ptr_shared_end,
-                                                                                                                                int shared_num)
+                                                                                                                                int shared_num,
+                                                                                                                                int max_iter)
 {
     int global_id = blockIdx.x * blockDim.x + threadIdx.x;
     const int blki_blc = global_id >> 5;
@@ -1517,8 +1526,8 @@ __forceinline__ __global__ void stir_spmv_cuda_kernel_newcsr_nnz_balance_below_t
             __threadfence();
         } while (signal_final1[0] != shared_num);
 
-        // for(int iter=1;(iter<=100)&&(k_snew[0]>k_threshold[0]);iter++)
-        for (iter = 1; (iter <= 100); iter++)
+        // for(int iter=1;(iter<=max_iter)&&(k_snew[0]>k_threshold[0]);iter++)
+        for (iter = 1; (iter <= max_iter); iter++)
         {
             if (threadIdx.x < WARP_PER_BLOCK)
             {
@@ -2235,51 +2244,48 @@ __global__ void stir_spmv_cuda_kernel_newcsr_balance_inc_balance_mix(
     }
 }
 
-extern "C" void cg_solve_inc(int *RowPtr, int *ColIdx, MAT_VAL_TYPE *Val, MAT_VAL_LOW_TYPE *Val_Low, double *x, double *b, int n, int *iter, int maxiter, double threshold, char *filename, int nnzR, int ori)
+// cg_solve_inc: 混合精度CG（共轭梯度）主流程，带详细注释
+extern "C" void cg_solve_inc(int *RowPtr, int *ColIdx, MAT_VAL_TYPE *Val, MAT_VAL_LOW_TYPE *Val_Low, double *x, double *b, int n, int *iter, int maxiter, double threshold, char *filename, int nnzR, int ori, int max_iter, CgBenchResult *bench_result, int skip_output)
 {
     struct timeval t1, t2, t3, t4, t5, t6, t7, t8;
+
+    // 基础变量定义与Tile矩阵初始化
     int rowA = n;
     int colA = ori;
-    rowA = (rowA / BLOCK_SIZE) * BLOCK_SIZE;
+    rowA = (rowA / BLOCK_SIZE) * BLOCK_SIZE; // 行数按BLOCK_SIZE对齐
     Tile_matrix *matrix = (Tile_matrix *)malloc(sizeof(Tile_matrix));
-    Tile_create(matrix,
-                rowA, colA, nnzR,
-                RowPtr,
-                ColIdx,
-                Val,
-                Val_Low);
+    // 构建Tile格式稀疏矩阵
+    Tile_create(matrix, rowA, colA, nnzR, RowPtr, ColIdx, Val, Val_Low);
+
     int num_seg = ceil((double)rowA / BLOCK_SIZE);
     int tilenum = matrix->tilenum;
-    int *ptroffset1 = (int *)malloc(sizeof(int) * tilenum);
-    int *ptroffset2 = (int *)malloc(sizeof(int) * tilenum);
+    int *ptroffset1 = (int *)malloc(sizeof(int) * tilenum);   // tile偏移指针1
+    int *ptroffset2 = (int *)malloc(sizeof(int) * tilenum);   // tile偏移指针2
     memset(ptroffset1, 0, sizeof(int) * tilenum);
     memset(ptroffset2, 0, sizeof(int) * tilenum);
-    MAT_VAL_TYPE *y_golden = (MAT_VAL_TYPE *)malloc(sizeof(MAT_VAL_TYPE) * rowA);
-    MAT_VAL_TYPE *y = (MAT_VAL_TYPE *)malloc(sizeof(MAT_VAL_TYPE) * n);
-    memset(x, 0, sizeof(double) * n);
+
+    // 结果缓冲区与辅助变量
+    MAT_VAL_TYPE *y_golden = (MAT_VAL_TYPE *)malloc(sizeof(MAT_VAL_TYPE) * rowA); // CPU黄金结果
+    MAT_VAL_TYPE *y = (MAT_VAL_TYPE *)malloc(sizeof(MAT_VAL_TYPE) * n);           // CPU测试缓冲
+    memset(x, 0, sizeof(double) * n);     // 输入初始解为0
     memset(y, 0, sizeof(MAT_VAL_TYPE) * n);
+
     int rowblkblock = 0;
     unsigned int *blkcoostylerowidx;
     int *blkcoostylerowidx_colstart;
     int *blkcoostylerowidx_colstop;
+
     int device_id = 0;
     cudaSetDevice(device_id);
     cudaDeviceProp deviceProp;
     cudaGetDeviceProperties(&deviceProp, device_id);
-    blockspmv_cpu(matrix,
-                  ptroffset1,
-                  ptroffset2,
-                  &rowblkblock,
-                  &blkcoostylerowidx,
-                  &blkcoostylerowidx_colstart,
-                  &blkcoostylerowidx_colstop,
-                  rowA, colA, nnzR,
-                  RowPtr,
-                  ColIdx,
-                  Val,
-                  x,
-                  y,
-                  y_golden);
+
+    // CPU端 SPMV，生成CPU参考结果及相关块间偏移表
+    blockspmv_cpu(matrix, ptroffset1, ptroffset2, &rowblkblock,
+                  &blkcoostylerowidx, &blkcoostylerowidx_colstart, &blkcoostylerowidx_colstop,
+                  rowA, colA, nnzR, RowPtr, ColIdx, Val, x, y, y_golden);
+
+    // Tile矩阵结构成员变量
     int tilem = matrix->tilem;
     int tilen = matrix->tilen;
     MAT_PTR_TYPE *tile_ptr = matrix->tile_ptr;
@@ -2296,20 +2302,22 @@ extern "C" void cg_solve_inc(int *RowPtr, int *ColIdx, MAT_VAL_TYPE *Val, MAT_VA
     int csrptrlen = matrix->csrptrlen;
     int csr_csize = csrsize % 2 == 0 ? csrsize / 2 : csrsize / 2 + 1;
 
+    // CUDA设备内存申请与拷贝（tile信息等），tile行/列指针等
     MAT_PTR_TYPE *d_tile_ptr;
     int *d_tile_columnidx;
-    int *tile_rowidx = (int *)malloc(sizeof(int) * tilenum);
+    int *tile_rowidx = (int *)malloc(sizeof(int) * tilenum); // tile row->tile id映射
     memset(tile_rowidx, 0, sizeof(int) * tilenum);
     int *d_tile_rowidx;
     cudaMalloc((void **)&d_tile_rowidx, tilenum * sizeof(int));
     cudaMalloc((void **)&d_tile_ptr, (tilem + 1) * sizeof(MAT_PTR_TYPE));
     cudaMalloc((void **)&d_tile_columnidx, tilenum * sizeof(int));
-
     cudaMemcpy(d_tile_ptr, tile_ptr, (tilem + 1) * sizeof(MAT_PTR_TYPE), cudaMemcpyHostToDevice);
     cudaMemcpy(d_tile_columnidx, tile_columnidx, tilenum * sizeof(int), cudaMemcpyHostToDevice);
+
     int *tile_columnidx_new = (int *)malloc(sizeof(int) * tilenum);
     memset(tile_columnidx_new, 0, sizeof(int) * tilenum);
-    // CSR
+
+    // CSR相关设备内存
     unsigned char *d_csr_compressedIdx = (unsigned char *)malloc((csr_csize) * sizeof(unsigned char));
     MAT_VAL_TYPE *d_Blockcsr_Val;
     unsigned char *d_Blockcsr_Ptr;
@@ -2317,11 +2325,11 @@ extern "C" void cg_solve_inc(int *RowPtr, int *ColIdx, MAT_VAL_TYPE *Val, MAT_VA
     cudaMalloc((void **)&d_csr_compressedIdx, (csr_csize) * sizeof(unsigned char));
     cudaMalloc((void **)&d_Blockcsr_Val, (csrsize) * sizeof(MAT_VAL_TYPE));
     cudaMalloc((void **)&d_Blockcsr_Ptr, (csrptrlen) * sizeof(unsigned char));
-
     cudaMemcpy(d_csr_compressedIdx, csr_compressedIdx, (csr_csize) * sizeof(unsigned char), cudaMemcpyHostToDevice);
     cudaMemcpy(d_Blockcsr_Val, Blockcsr_Val, (csrsize) * sizeof(MAT_VAL_TYPE), cudaMemcpyHostToDevice);
     cudaMemcpy(d_Blockcsr_Ptr, Blockcsr_Ptr, (csrptrlen) * sizeof(unsigned char), cudaMemcpyHostToDevice);
 
+    // 不同精度的val版本（float/half/int8），为混合精度准备
     float *d_Blockcsr_Val_float;
     half *d_Blockcsr_Val_half;
     half *Blockcsr_Val_half = (half *)malloc(sizeof(half) * csrsize);
@@ -2341,6 +2349,7 @@ extern "C" void cg_solve_inc(int *RowPtr, int *ColIdx, MAT_VAL_TYPE *Val, MAT_VA
     free(Blockcsr_Val_half);
     free(Blockcsr_Val_int8);
 
+    // 还有blkcoostyle row相关设备内存分配
     unsigned int *d_blkcoostylerowidx;
     int *d_blkcoostylerowidx_colstart;
     int *d_blkcoostylerowidx_colstop;
@@ -2348,29 +2357,30 @@ extern "C" void cg_solve_inc(int *RowPtr, int *ColIdx, MAT_VAL_TYPE *Val, MAT_VA
     cudaMalloc((void **)&d_blkcoostylerowidx, rowblkblock * sizeof(unsigned int));
     cudaMalloc((void **)&d_blkcoostylerowidx_colstart, rowblkblock * sizeof(int));
     cudaMalloc((void **)&d_blkcoostylerowidx_colstop, rowblkblock * sizeof(int));
-
     cudaMemcpy(d_blkcoostylerowidx, blkcoostylerowidx, rowblkblock * sizeof(unsigned int), cudaMemcpyHostToDevice);
     cudaMemcpy(d_blkcoostylerowidx_colstart, blkcoostylerowidx_colstart, rowblkblock * sizeof(int), cudaMemcpyHostToDevice);
     cudaMemcpy(d_blkcoostylerowidx_colstop, blkcoostylerowidx_colstop, rowblkblock * sizeof(int), cudaMemcpyHostToDevice);
 
+    // ptroffset（tile粗粒度行列分块指针）CUDA内存
     int *d_ptroffset1;
     int *d_ptroffset2;
-
     cudaMalloc((void **)&d_ptroffset1, tilenum * sizeof(int));
     cudaMalloc((void **)&d_ptroffset2, tilenum * sizeof(int));
     cudaMemcpy(d_ptroffset1, ptroffset1, tilenum * sizeof(int), cudaMemcpyHostToDevice);
     cudaMemcpy(d_ptroffset2, ptroffset2, tilenum * sizeof(int), cudaMemcpyHostToDevice);
 
-    // x and y
+    // x/y向量CUDA缓存
     MAT_VAL_TYPE *d_x;
     MAT_VAL_TYPE *d_y;
-
     cudaMalloc((void **)&d_x, rowA * sizeof(MAT_VAL_TYPE));
     cudaMalloc((void **)&d_y, rowA * sizeof(MAT_VAL_TYPE));
+
+    // CUDA核参数设置
     int num_threads = WARP_PER_BLOCK * WARP_SIZE;
     int num_blocks = ceil((double)rowblkblock / (double)(num_threads / WARP_SIZE));
     int num_blocks_new = ceil((double)(tilem) / (double)(num_threads / WARP_SIZE));
 
+    // CG算法相关的混合精度buffer
     float *k_d_float, *k_q_float;
     half *k_d_half;
     int8_t *k_d_int8;
@@ -2380,6 +2390,7 @@ extern "C" void cg_solve_inc(int *RowPtr, int *ColIdx, MAT_VAL_TYPE *Val, MAT_VA
     cudaMalloc((void **)&k_q_float, sizeof(float) * (n));
     cudaMemset(k_q_float, 0, n * sizeof(float));
 
+    // 双精度buffer/参数
     double *k_b, *k_x, *k_r, *k_d, *k_q, *k_s;
     double *k_alpha, *k_snew, *k_beta, *k_sold, *k_s0;
     double t, s0, snew;
@@ -2387,6 +2398,7 @@ extern "C" void cg_solve_inc(int *RowPtr, int *ColIdx, MAT_VAL_TYPE *Val, MAT_VA
     double *k_val;
     int iterations = 0;
 
+    // CUDA端 b/val/x/r/d/q 及alpha,beta等申请和初始化
     cudaMalloc((void **)&k_b, sizeof(double) * (n));
     cudaMemcpy(k_b, b, sizeof(double) * (n), cudaMemcpyHostToDevice);
     cudaMalloc((void **)&k_val, sizeof(double) * (nnzR));
@@ -2395,7 +2407,7 @@ extern "C" void cg_solve_inc(int *RowPtr, int *ColIdx, MAT_VAL_TYPE *Val, MAT_VA
     cudaMalloc((void **)&k_x, sizeof(double) * (n));
     cudaMalloc((void **)&k_r, sizeof(double) * (n + 1));
     cudaMalloc((void **)&k_d, sizeof(double) * (n + 1));
-    double *d_last = (double *)malloc(sizeof(double) * (n + 1));
+    double *d_last = (double *)malloc(sizeof(double) * (n + 1));     // host端(调试？)
     memset(d_last, 0, sizeof(double) * (n + 1));
     double *d = (double *)malloc(sizeof(double) * (n + 1));
     memset(d, 0, sizeof(double) * (n + 1));
@@ -2414,30 +2426,32 @@ extern "C" void cg_solve_inc(int *RowPtr, int *ColIdx, MAT_VAL_TYPE *Val, MAT_VA
     dim3 BlockDim(128);
     dim3 GridDim((n / 128 + 1));
 
-    veczero<<<1, BlockDim>>>(n, k_x);
-    // r=b-Ax (r=b since x=0), and d=M^(-1)r
-    cudaMemcpy(k_r, k_b, sizeof(double) * (n), cudaMemcpyDeviceToDevice);
+    // 初始化 x, r, d
+    veczero<<<1, BlockDim>>>(n, k_x); // 全零
+    cudaMemcpy(k_r, k_b, sizeof(double) * (n), cudaMemcpyDeviceToDevice); // r = b
     cudaMemset(k_s0, 0, sizeof(double));
-
-    sdot2_2<<<GridDim, BlockDim>>>(k_r, k_r, k_s0, n);
+    sdot2_2<<<GridDim, BlockDim>>>(k_r, k_r, k_s0, n); // s0 = r^T r
     cudaMemcpy(k_d, k_r, sizeof(double) * (n + 1), cudaMemcpyDeviceToDevice);
+
+    // d向量各类型转换(混合精度相关)
     device_convert<<<num_seg, BLOCK_SIZE>>>(k_d, k_d_float, n);
     device_convert_half<<<num_seg, BLOCK_SIZE>>>(k_d, k_d_half, n);
     device_convert_int8<<<num_seg, BLOCK_SIZE>>>(k_d, k_d_int8, n);
-    // r[n] = 1.2;
-    //  snew = s0
+
+    // snew = s0
     scalarassign(k_snew, k_s0);
-    // Copy snew and s0 back to host so that host can evaluate stopping condition
     cudaMemcpy(&snew, k_snew, sizeof(double), cudaMemcpyDeviceToHost);
     cudaMemcpy(&s0, k_s0, sizeof(double), cudaMemcpyDeviceToHost);
     double time_spmv = 0;
 
-    // tile_newcsr
+    // -------- tile_newcsr结构、行压缩相关 --------
     int csroffset = 0;
     int csrcount = 0;
     int *nonzero_row_new = (int *)malloc(sizeof(int) * (tilenum + 1));
     memset(nonzero_row_new, 0, sizeof(int) * (tilenum + 1));
     gettimeofday(&t5, NULL);
+
+    // 矩阵压缩成tile_newcsr格式，统计每个tile的有效行数
 #pragma omp parallel for
     for (int blki = 0; blki < tilem; blki++)
     {
@@ -2457,16 +2471,20 @@ extern "C" void cg_solve_inc(int *RowPtr, int *ColIdx, MAT_VAL_TYPE *Val, MAT_VA
             nonzero_row_new[blkj] += 1;
         }
     }
-    exclusive_scan(nonzero_row_new, tilenum + 1);
+    exclusive_scan(nonzero_row_new, tilenum + 1); // 行累计和构成行压缩格式
     int cnt_non_new = nonzero_row_new[tilenum];
+
+    // 新行/CSR结构相关缓冲
     unsigned char *blockrowid_new = (unsigned char *)malloc(sizeof(unsigned char) * (cnt_non_new + 1));
     memset(blockrowid_new, 0, sizeof(unsigned char) * (cnt_non_new + 1));
     unsigned char *blockcsr_ptr_new = (unsigned char *)malloc(sizeof(unsigned char) * (cnt_non_new + 1));
     memset(blockcsr_ptr_new, 0, sizeof(unsigned char) * (cnt_non_new + 1));
     int csrcount_new1 = 0;
+
     int *block_signal = (int *)malloc(sizeof(int) * (tilem + 4));
-    memset(block_signal, 0, sizeof(int) * (tilem + 4)); // 记录块数
-    // #pragma omp parallel for
+    memset(block_signal, 0, sizeof(int) * (tilem + 4)); // 记录每个tile内块数（如分配warp之用）
+
+    // tile行压缩新结构填充，每个非零行的行号和CSR偏移
     for (int blki = 0; blki < tilem; blki++)
     {
         int rowlength = blki == tilem - 1 ? rowA - (tilem - 1) * BLOCK_SIZE : BLOCK_SIZE;
@@ -2495,16 +2513,18 @@ extern "C" void cg_solve_inc(int *RowPtr, int *ColIdx, MAT_VAL_TYPE *Val, MAT_VA
         }
     }
 
-    // 负载均衡部分 重新分配每个warp需要计算的非零元
-    int *non_each_block = (int *)malloc(sizeof(int) * (tilenum + 1));        // 记录每个块的非零元个数
-    int *non_each_block_offset = (int *)malloc(sizeof(int) * (tilenum + 1)); // 用于shared memory的索引
-    int *row_each_block = (int *)malloc(sizeof(int) * (tilenum + 1));        // 记录每个块的行号
-    int *index_each_block = (int *)malloc(sizeof(int) * (tilenum + 1));      // 排序前每个块的索引
+    // ------------------- 负载均衡部分(以非零元为粒度分配warp计算任务) -------------------
+    int *non_each_block = (int *)malloc(sizeof(int) * (tilenum + 1));         // 每个块的非零元数
+    int *non_each_block_offset = (int *)malloc(sizeof(int) * (tilenum + 1));  // shared memory 索引offset
+    int *row_each_block = (int *)malloc(sizeof(int) * (tilenum + 1));         // 每个块所属tile行
+    int *index_each_block = (int *)malloc(sizeof(int) * (tilenum + 1));       // 块原始序号
+
     memset(non_each_block, 0, sizeof(int) * (tilenum + 1));
     memset(non_each_block_offset, 0, sizeof(int) * (tilenum + 1));
     memset(row_each_block, 0, sizeof(int) * (tilenum + 1));
     memset(index_each_block, 0, sizeof(int) * (tilenum + 1));
     int nnz_total = 0;
+    // 遍历所有tile，统计每个tile块的非零元数、归属tile行以及序号
     for (int blki = 0; blki < tilem; blki++)
     {
         for (int blkj = tile_ptr[blki]; blkj < tile_ptr[blki + 1]; blkj++)
@@ -2516,24 +2536,17 @@ extern "C" void cg_solve_inc(int *RowPtr, int *ColIdx, MAT_VAL_TYPE *Val, MAT_VA
         }
     }
 
-    int *row_each_block_new = (int *)malloc(sizeof(int) * (tilenum + 1));   // 记录每个块的行号
-    int *index_each_block_new = (int *)malloc(sizeof(int) * (tilenum + 1)); // 排序前每个块的索引
+    // 新负载划分结构，排序后块行、序列和对应nnz数
+    int *row_each_block_new = (int *)malloc(sizeof(int) * (tilenum + 1));  // 记录每个块的行号
+    int *index_each_block_new = (int *)malloc(sizeof(int) * (tilenum + 1));  // 排序前每个块的索引
     int *non_each_block_new = (int *)malloc(sizeof(int) * (tilenum + 1));
     memset(row_each_block_new, 0, sizeof(int) * (tilenum + 1));
     memset(index_each_block_new, 0, sizeof(int) * (tilenum + 1));
     memset(non_each_block_new, 0, sizeof(int) * (tilenum + 1));
-    int each_block_nnz = 16;
-    int cnt = 0;
-    int balance_row = 0;
-    int index = 1;
-    int i = 0;
-    int j = tilenum - 1;
-    cnt = 0;
-    index = 1;
-    int step = 0;
-    int block_per_warp = 180;
-    int cnt_block1 = 0;
-    int nnz_list[12] = {16, 32, 64, 96, 128, 256, 512, 1024, 2048, 4096, nnzR / 6912};
+    int each_block_nnz = 16; // warp内想要分到的非零元数
+    int cnt = 0, balance_row = 0, index = 1, i = 0, j = tilenum - 1, step = 0, block_per_warp = 180, cnt_block1 = 0;
+    int nnz_list[12] = {16, 32, 64, 96, 128, 256, 512, 1024, 2048, 4096, nnzR / 6912}; // 用于尝试合适分配粒度的预设值
+    // 粒度自适应策略：二分、贪心遍历不同nnz阈值和块数量，使warp负载趋于均衡
     while (1)
     {
         for (int k = 0; k < 12; k++)
@@ -2547,6 +2560,7 @@ extern "C" void cg_solve_inc(int *RowPtr, int *ColIdx, MAT_VAL_TYPE *Val, MAT_VA
             cnt_block1 = 0;
             while (i < j)
             {
+                // 从头部合并
                 if (((non_each_block[i] + cnt) < each_block_nnz) && ((cnt_block1 + 1) < block_per_warp))
                 {
                     cnt += non_each_block[i];
@@ -2560,6 +2574,7 @@ extern "C" void cg_solve_inc(int *RowPtr, int *ColIdx, MAT_VAL_TYPE *Val, MAT_VA
                     cnt = 0;
                     cnt_block1 = 0;
                 }
+                // 尾部合并
                 if (((non_each_block[j] + cnt) < each_block_nnz) && ((cnt_block1 + 1) < block_per_warp))
                 {
                     cnt += non_each_block[j];
@@ -2575,12 +2590,13 @@ extern "C" void cg_solve_inc(int *RowPtr, int *ColIdx, MAT_VAL_TYPE *Val, MAT_VA
                 }
             }
             if (index < 6912)
-                break;
+                break; // 找到划分
         }
         if (index < 6912)
             break;
         block_per_warp = block_per_warp * 2;
     }
+    // warp分配后的tile向量参数，用于不同tile适配不同线程组织方式
     int vector_each_warp_16;
     int vector_total_16;
     int vector_each_warp_32;
@@ -2596,10 +2612,14 @@ extern "C" void cg_solve_inc(int *RowPtr, int *ColIdx, MAT_VAL_TYPE *Val, MAT_VA
     }
     if (index > 6912 || index == 0 || tilem == 0)
         return;
+
+    // warp分块结果存储与设备传输
     int *balance_tile_ptr_new = (int *)malloc(sizeof(int) * (index + 1));
     memset(balance_tile_ptr_new, 0, sizeof(int) * (index + 1));
     int *balance_tile_ptr_shared_end = (int *)malloc(sizeof(int) * (index + 1));
     memset(balance_tile_ptr_shared_end, 0, sizeof(int) * (index + 1));
+
+    // 排序、记录新的块划分策略
     i = 0;
     j = tilenum - 1;
     cnt = 0;
@@ -2669,15 +2689,19 @@ extern "C" void cg_solve_inc(int *RowPtr, int *ColIdx, MAT_VAL_TYPE *Val, MAT_VA
         }
     }
 
+    // 分块指针与相关向量cuda分配
     int *d_balance_tile_ptr_new;
     cudaMalloc((void **)&d_balance_tile_ptr_new, sizeof(int) * (index + 1));
     cudaMemcpy(d_balance_tile_ptr_new, balance_tile_ptr_new, sizeof(int) * (index + 1), cudaMemcpyHostToDevice);
+
     int *d_row_each_block;
     int *d_index_each_block;
     cudaMalloc((void **)&d_row_each_block, sizeof(int) * (tilenum + 1));
     cudaMalloc((void **)&d_index_each_block, sizeof(int) * (tilenum + 1));
     cudaMemcpy(d_row_each_block, row_each_block_new, sizeof(int) * (tilenum + 1), cudaMemcpyHostToDevice);
     cudaMemcpy(d_index_each_block, index_each_block_new, sizeof(int) * (tilenum + 1), cudaMemcpyHostToDevice);
+
+    // shared queue下offset分配
     int cnt_block = 0;
     int cnt_nnz = 0;
     for (int i = 0; i <= index; i++)
@@ -2715,6 +2739,8 @@ extern "C" void cg_solve_inc(int *RowPtr, int *ColIdx, MAT_VAL_TYPE *Val, MAT_VA
     int *d_balance_tile_ptr_shared_end;
     cudaMalloc((void **)&d_balance_tile_ptr_shared_end, sizeof(int) * (index + 1));
     cudaMemcpy(d_balance_tile_ptr_shared_end, balance_tile_ptr_shared_end, sizeof(int) * (index + 1), cudaMemcpyHostToDevice);
+
+    // 各类信号与判定、阈值变量申请
     int *d_block_signal;
     cudaMalloc((void **)&d_block_signal, sizeof(int) * (tilem + 4));
     int *signal_dot;
@@ -2728,12 +2754,15 @@ extern "C" void cg_solve_inc(int *RowPtr, int *ColIdx, MAT_VAL_TYPE *Val, MAT_VA
     cudaMalloc((void **)&k_threshold, sizeof(double));
     int *d_ori_block_signal;
     cudaMalloc((void **)&d_ori_block_signal, sizeof(int) * (tilem + 4));
-
     cudaMemcpy(d_block_signal, block_signal, sizeof(int) * (tilem + 4), cudaMemcpyHostToDevice);
     cudaMemcpy(d_ori_block_signal, block_signal, sizeof(int) * (tilem + 4), cudaMemcpyHostToDevice);
+
     gettimeofday(&t6, NULL);
     double time_format = (t6.tv_sec - t5.tv_sec) * 1000.0 + (t6.tv_usec - t5.tv_usec) / 1000.0;
+
     double pro_cnt = 0.0;
+
+    // tile_newcsr结构拷贝到CUDA端
     unsigned char *d_blockrowid_new;
     unsigned char *d_blockcsr_ptr_new;
     int *d_nonzero_row_new;
@@ -2747,23 +2776,31 @@ extern "C" void cg_solve_inc(int *RowPtr, int *ColIdx, MAT_VAL_TYPE *Val, MAT_VA
     cudaMemcpy(d_nonzero_row_new, nonzero_row_new, sizeof(int) * (tilenum + 1), cudaMemcpyHostToDevice);
     cudaMemcpy(d_Tile_csr_Col, Tile_csr_Col, sizeof(unsigned char) * (matrix->csrsize), cudaMemcpyHostToDevice);
     cudaMemcpy(d_tile_rowidx, tile_rowidx, sizeof(int) * (tilenum), cudaMemcpyHostToDevice);
+
+    // 计算阈值
     threshold = epsilon * epsilon * s0;
     double *k_d_last;
     cudaMalloc((void **)&k_d_last, sizeof(double) * (n + 1));
     cudaMemset(k_d_last, 0, sizeof(double) * (n + 1));
     double *k_x_new;
     cudaMemcpy(k_threshold, &threshold, sizeof(double), cudaMemcpyHostToDevice);
-    gettimeofday(&t1, NULL);
+
+    gettimeofday(&t1, NULL); // 计时起点
+
+    // ------------------ 混合精度CG核心循环与CUDA核调度 -------------------
     {
         if (index < tilem)
         {
+            // 自适应方式下优先采用tile合并维度32的模式
             int num_blocks_nnz_balance = ceil((double)(index) / (double)(num_threads / WARP_SIZE));
             cudaMemset(d_block_signal, 0, sizeof(int) * (tilem + 1));
+
             if (vector_each_warp_32 * vector_total_32 * 32 > rowA)
             {
                 rowA = vector_each_warp_32 * vector_total_32 * 32;
             }
             int tilem_new = rowA / BLOCK_SIZE;
+            // 新分配（大尺寸）相关内存
             int *d_block_signal_new;
             cudaMalloc((void **)&d_block_signal_new, sizeof(int) * (tilem_new + 1));
             cudaMemset(d_block_signal_new, 0, sizeof(int) * (tilem_new + 1));
@@ -2771,6 +2808,7 @@ extern "C" void cg_solve_inc(int *RowPtr, int *ColIdx, MAT_VAL_TYPE *Val, MAT_VA
             cudaMalloc((void **)&d_ori_block_signal_new, sizeof(int) * (tilem_new + 1));
             cudaMemset(d_ori_block_signal_new, 0, sizeof(int) * (tilem_new + 1));
             cudaMemcpy(d_ori_block_signal_new, block_signal, sizeof(int) * (tilem + 1), cudaMemcpyHostToDevice);
+
             double *k_q_new;
             cudaMalloc((void **)&k_q_new, sizeof(double) * (rowA + 1));
             double *k_d_new;
@@ -2784,6 +2822,7 @@ extern "C" void cg_solve_inc(int *RowPtr, int *ColIdx, MAT_VAL_TYPE *Val, MAT_VA
             cudaMalloc((void **)&k_x_new, sizeof(double) * (rowA + 1));
             cudaMemset(k_x_new, 0, (rowA + 1) * sizeof(double));
             cudaMemcpy(k_x_new, k_x, sizeof(double) * (n), cudaMemcpyDeviceToDevice);
+
             int *d_vis;
             cudaMalloc((void **)&d_vis, (rowA + 1) * sizeof(int));
             cudaMemset(d_vis, 0, (rowA + 1) * sizeof(int));
@@ -2798,8 +2837,10 @@ extern "C" void cg_solve_inc(int *RowPtr, int *ColIdx, MAT_VAL_TYPE *Val, MAT_VA
             cudaMemcpy(k_d_int8_new, &k_d_int8, sizeof(int8_t) * (n), cudaMemcpyDeviceToDevice);
             cudaMalloc((void **)&k_q_float_new, sizeof(float) * (rowA + 1));
             cudaMemcpy(k_q_float_new, &k_q_float, sizeof(float) * (n), cudaMemcpyDeviceToDevice);
+
             cudaDeviceSynchronize();
             gettimeofday(&t3, NULL);
+            // 混合精度tile-newCSR NNZ-自适应主核（所有参数详见核说明）
             stir_spmv_cuda_kernel_newcsr_nnz_balance_below_tilem_32_block_reduce_mix_precision<<<num_blocks_nnz_balance, num_threads>>>(tilem, tilenum, rowA, colA, nnzR,
                                                                                                                                         d_tile_ptr, d_tile_columnidx,
                                                                                                                                         d_csr_compressedIdx, d_Blockcsr_Val, d_Blockcsr_Ptr,
@@ -2810,7 +2851,7 @@ extern "C" void cg_solve_inc(int *RowPtr, int *ColIdx, MAT_VAL_TYPE *Val, MAT_VA
                                                                                                                                         k_alpha, k_snew, k_x_new, k_r_new, k_sold, k_beta, k_threshold,
                                                                                                                                         d_balance_tile_ptr_new, d_row_each_block, d_index_each_block, index, d_non_each_block_offset,
                                                                                                                                         vector_each_warp_32, vector_total_32, d_vis, k_d_last, d_Blockcsr_Val_float, d_Blockcsr_Val_half, d_Blockcsr_Val_int8,
-                                                                                                                                        k_d_float_new, k_d_half_new, k_d_int8_new, k_q_float_new);
+                                                                                                                                        k_d_float_new, k_d_half_new, k_d_int8_new, k_q_float_new, max_iter);
 
             // stir_spmv_cuda_kernel_newcsr_nnz_balance_below_tilem_32_block_reduce_shared_queue_mix_precision<<<num_blocks_nnz_balance, num_threads>>>(tilem, tilenum, rowA, colA, nnzR,
             //                                                                                                                                          d_tile_ptr, d_tile_columnidx,
@@ -2822,17 +2863,18 @@ extern "C" void cg_solve_inc(int *RowPtr, int *ColIdx, MAT_VAL_TYPE *Val, MAT_VA
             //                                                                                                                                          k_alpha, k_snew, k_x_new, k_r_new, k_sold, k_beta, k_threshold,
             //                                                                                                                                          d_balance_tile_ptr_new, d_row_each_block, d_index_each_block, index, d_non_each_block_offset,
             //                                                                                                                                          vector_each_warp_32, vector_total_32, d_vis, k_d_last, d_Blockcsr_Val_float, d_Blockcsr_Val_half, d_Blockcsr_Val_int8,
-            //                                                                                                                                          k_d_float_new, k_d_half_new, k_d_int8_new, k_q_float_new, d_balance_tile_ptr_shared_end, shared_num);
+            //                                                                                                                                          k_d_float_new, k_d_half_new, k_d_int8_new, k_q_float_new, d_balance_tile_ptr_shared_end, shared_num, max_iter);
 
             cudaDeviceSynchronize();
         }
         else
         {
+            // tile数量等于分块数，直接标准调度
             if (index == tilem)
                 index = tilem + 1;
             cudaMemset(d_block_signal, 0, sizeof(int) * (tilem + 1));
             int num_blocks_nnz_balance = ceil((double)(index) / (double)(num_threads / WARP_SIZE));
-            // 扩大容量
+            // 扩大容量以适配所有tile，保证能够按block粒度发射核
             int tilem_new = (tilem / WARP_PER_BLOCK + 2) * WARP_PER_BLOCK;
             int re_size = (tilem_new)*BLOCK_SIZE;
             int *d_block_signal_new;
@@ -2852,10 +2894,10 @@ extern "C" void cg_solve_inc(int *RowPtr, int *ColIdx, MAT_VAL_TYPE *Val, MAT_VA
             cudaMalloc((void **)&k_r_new, sizeof(double) * re_size);
             cudaMemset(k_r_new, 0, re_size * sizeof(double));
             cudaMemcpy(k_r_new, k_r, sizeof(double) * (n), cudaMemcpyDeviceToDevice);
-            // double *k_x_new;
             cudaMalloc((void **)&k_x_new, sizeof(double) * re_size);
             cudaMemset(k_x_new, 0, re_size * sizeof(double));
             cudaMemcpy(k_x_new, k_x, sizeof(double) * (n), cudaMemcpyDeviceToDevice);
+
             int *d_vis;
             cudaMalloc((void **)&d_vis, tilem_new * sizeof(int));
             cudaMemset(d_vis, 0, tilem_new * sizeof(int));
@@ -2870,6 +2912,7 @@ extern "C" void cg_solve_inc(int *RowPtr, int *ColIdx, MAT_VAL_TYPE *Val, MAT_VA
             cudaMemcpy(k_d_int8_new, &k_d_int8, sizeof(int8_t) * (n), cudaMemcpyDeviceToDevice);
             cudaMalloc((void **)&k_q_float_new, sizeof(float) * (re_size));
             cudaMemcpy(k_q_float_new, &k_q_float, sizeof(float) * (n), cudaMemcpyDeviceToDevice);
+
             cudaDeviceSynchronize();
             gettimeofday(&t3, NULL);
             // 都放在global memory上
@@ -2883,7 +2926,7 @@ extern "C" void cg_solve_inc(int *RowPtr, int *ColIdx, MAT_VAL_TYPE *Val, MAT_VA
                                                                                                                           k_alpha, k_snew, k_x_new, k_r_new, k_sold, k_beta, k_threshold,
                                                                                                                           d_balance_tile_ptr_new, d_row_each_block, d_index_each_block, index, d_non_each_block_offset, d_vis,
                                                                                                                           d_Blockcsr_Val_float, d_Blockcsr_Val_half, d_Blockcsr_Val_int8,
-                                                                                                                          k_d_float_new, k_d_half_new, k_d_int8_new, k_q_float_new);
+                                                                                                                          k_d_float_new, k_d_half_new, k_d_int8_new, k_q_float_new, max_iter);
             // 放在shared memory上
             //  stir_spmv_cuda_kernel_newcsr_nnz_balance_redce_block_shared_queue_mixed_precision<<<num_blocks_nnz_balance, num_threads>>>(tilem_new, tilenum, rowA, colA, nnzR,
             //                                                                                    d_tile_ptr, d_tile_columnidx,
@@ -2895,17 +2938,29 @@ extern "C" void cg_solve_inc(int *RowPtr, int *ColIdx, MAT_VAL_TYPE *Val, MAT_VA
             //                                                                                    k_alpha, k_snew, k_x_new, k_r_new, k_sold, k_beta, k_threshold,
             //                                                                                    d_balance_tile_ptr_new, d_row_each_block, d_index_each_block, index, d_non_each_block_offset,d_balance_tile_ptr_shared_end,d_vis,
             //                                                                                    d_Blockcsr_Val_float, d_Blockcsr_Val_half, d_Blockcsr_Val_int8,
-            //                                                                                    k_d_float_new, k_d_half_new, k_d_int8_new, k_q_float_new,shared_num);
+            //                                                                                    k_d_float_new, k_d_half_new, k_d_int8_new, k_q_float_new,shared_num, max_iter);
         }
-        cudaDeviceSynchronize();
-        gettimeofday(&t4, NULL);
+        cudaDeviceSynchronize(); // 等待核执行结束
+        gettimeofday(&t4, NULL); // SPMV时间计量
         time_spmv += (t4.tv_sec - t3.tv_sec) * 1000.0 + (t4.tv_usec - t3.tv_usec) / 1000.0;
-        cudaMemcpy(&snew, k_snew, sizeof(double), cudaMemcpyDeviceToHost);
+        cudaMemcpy(&snew, k_snew, sizeof(double), cudaMemcpyDeviceToHost); // 拉回收敛判据
     }
     cudaDeviceSynchronize();
-    gettimeofday(&t2, NULL);
+    gettimeofday(&t2, NULL); // 结束时间
+
+    // 更新主解
     cudaMemcpy(x, k_x_new, sizeof(double) * (n), cudaMemcpyDeviceToHost);
-    double time_cg = (t2.tv_sec - t1.tv_sec) * 1000.0 + (t2.tv_usec - t1.tv_usec) / 1000.0;
+    double time_cg =
+        (t2.tv_sec - t1.tv_sec) * 1000.0 + (t2.tv_usec - t1.tv_usec) / 1000.0;
+    if (bench_result) {
+        bench_result->time_ms = time_cg;
+        bench_result->iterations = max_iter;
+    }
+    if (!skip_output) {
+        printf("time_cg-mixed: %f ms\n", time_cg);
+    }
+
+    // --------- 验证部分：用最终x回代原矩阵，计算Ax与b的差值，计算L2范数 ---------
     double *b_new = (double *)malloc(sizeof(double) * n);
     memset(b_new, 0, sizeof(double) * n);
     for (int blki = 0; blki < tilem; blki++)
@@ -2948,19 +3003,29 @@ extern "C" void cg_solve_inc(int *RowPtr, int *ColIdx, MAT_VAL_TYPE *Val, MAT_VA
     {
         sum_ori = sum_ori + (b[i] * b[i]);
     }
-    double l2_norm = sqrt(sum) / sqrt(sum_ori);
-    char *s = (char *)malloc(sizeof(char) * 200);
-    sprintf(s, "%d,%.3f,%d,%e,%e\n", 100, time_cg, nnzR, l2_norm,sqrt(snew));
-    FILE *file1 = fopen("data/cg_performance.csv", "a");
-    if (file1 == NULL)
-    {
-        printf("open error!\n");
-        return;
+    double l2_norm = sqrt(sum) / sqrt(sum_ori); // 与原b的残差相对范数
+
+    if (bench_result) {
+        bench_result->l2_norm = l2_norm;
+        bench_result->residual = sqrt(snew);
     }
-    fwrite(filename, strlen(filename), 1, file1);
-    fwrite(",", strlen(","), 1, file1);
-    fwrite(s, strlen(s), 1, file1);
-    free(s);
+    if (!skip_output) {
+        char *s = (char *)malloc(sizeof(char) * 200);
+        sprintf(s, "%d,%.3f,%d,%e,%e\n", max_iter, time_cg, nnzR, l2_norm, sqrt(snew));
+        FILE *file1 = fopen("cg_mixed_performance.csv", "a");
+        if (file1 == NULL)
+        {
+            printf("open error!\n");
+            return;
+        }
+        fwrite(filename, strlen(filename), 1, file1);
+        fwrite(",", strlen(","), 1, file1);
+        fwrite(s, strlen(s), 1, file1);
+        fclose(file1);
+        free(s);
+    }
+
+    // -------- 资源释放 --------
     cudaFree(k_val);
     cudaFree(k_b);
     cudaFree(k_x);
@@ -3006,6 +3071,8 @@ extern "C" void cg_solve_inc(int *RowPtr, int *ColIdx, MAT_VAL_TYPE *Val, MAT_VA
 int main(int argc, char **argv)
 {
     char *filename = argv[1];
+    char *max_iter_mix_str = argv[2];  /* max_iter_mix = max_iter * 1.25，由 test 脚本传入 */
+    int max_iter_mix = atoi(max_iter_mix_str);
     int m, n, nnzR, isSymmetric;
     int *RowPtr;
     int *ColIdx;
@@ -3033,10 +3100,46 @@ int main(int argc, char **argv)
         X[i] = 1;
     }
     int iter = 0;
-    for (int i = 0; i < n; i++)
-        for (int j = RowPtr[i]; j < RowPtr[i + 1]; j++)
-        {
+    // y_golden 是用来存储稀疏矩阵-向量乘法（即 Y = A·X）的基准（黄金）结果的数组
+    // 用以快速校验实际 SPMV 或 CG 结果与理论正确性的差异
+    // 此处直接按标准稀疏矩阵乘法填充 y_golden（数学公式：Y_golden = A * X）
+    for (int i = 0; i < n; i++) {
+        for (int j = RowPtr[i]; j < RowPtr[i + 1]; j++) {
             Y_golden[i] += Val[j] * X[ColIdx[j]];
         }
-    cg_solve_inc(RowPtr, ColIdx, Val, Val_Low, X, Y_golden, n, &iter, 10, 1e-5, filename, nnzR, ori);
+    }
+
+    CgBenchResult result;
+    double times[BENCHMARK];
+    double time_avg = 0;
+
+    /* warmup */
+    for (int i = 0; i < WARMUP; i++) {
+        cg_solve_inc(RowPtr, ColIdx, Val, Val_Low, X, Y_golden, n, &iter, 10, 1e-5, filename, nnzR, ori, max_iter_mix, NULL, 1);
+    }
+
+    /* benchmark */
+    for (int i = 0; i < BENCHMARK; i++) {
+        cg_solve_inc(RowPtr, ColIdx, Val, Val_Low, X, Y_golden, n, &iter, 10, 1e-5, filename, nnzR, ori, max_iter_mix, &result, 1);
+        times[i] = result.time_ms;
+    }
+
+    for (int i = 0; i < BENCHMARK; i++)
+        time_avg += times[i];
+    time_avg /= BENCHMARK;
+
+    printf("time_cg-mixed_avg=%.3f ms (warmup=%d, benchmark=%d)\n", time_avg, WARMUP, BENCHMARK);
+
+    const char *out_csv = (argc >= 4) ? argv[3] : "cg_mixed_performance.csv";
+    const char *variant = "cg_mixed";
+
+    FILE *file1 = fopen(out_csv, "a");
+    if (file1 != NULL) {
+        long pos = ftell(file1);
+        if (pos == 0) {
+            fprintf(file1, "matrix,variant,iterations,time_ms,nnz,l2_norm,residual\n");
+        }
+        fprintf(file1, "%s,%s,%d,%.3f,%d,%e,%e\n", filename, variant, result.iterations, time_avg, nnzR, result.l2_norm, result.residual);
+        fclose(file1);
+    }
 }

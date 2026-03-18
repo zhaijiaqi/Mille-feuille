@@ -198,7 +198,8 @@ __global__ void stir_spmv_cuda_kernel_newcsr_nnz_balance(int tilem, int tilenum,
                                                          int *d_balance_tile_ptr,
                                                          int *d_row_each_block,
                                                          int *d_index_each_block,
-                                                         int balance_row)
+                                                         int balance_row,
+                                                         int max_iter)
 {
     int global_id = blockIdx.x * blockDim.x + threadIdx.x;
     const int blki_blc = global_id >> 5;
@@ -229,8 +230,8 @@ __global__ void stir_spmv_cuda_kernel_newcsr_nnz_balance(int tilem, int tilenum,
         int index_s;
         int csrcol;
 
-        // for(int iter=0;(iter<100)&&(k_snew[0]>k_threshold[0]);iter++)
-        for (int iter = 1; (iter <= 100); iter++)
+        // for(int iter=0;(iter<max_iter)&&(k_snew[0]>k_threshold[0]);iter++)
+        for (int iter = 1; (iter <= max_iter); iter++)
         {
             if (threadIdx.x < WARP_PER_BLOCK)
             {
@@ -382,7 +383,8 @@ __global__ void stir_spmv_cuda_kernel_newcsr_nnz_balance_redce_block(int tilem, 
                                                          int *d_balance_tile_ptr,
                                                          int *d_row_each_block,
                                                          int *d_index_each_block,
-                                                         int balance_row)
+                                                         int balance_row,
+                                                         int max_iter)
 {
     int global_id = blockIdx.x * blockDim.x + threadIdx.x;
     const int blki_blc = global_id >> 5;
@@ -422,8 +424,8 @@ __global__ void stir_spmv_cuda_kernel_newcsr_nnz_balance_redce_block(int tilem, 
         int offset=blki_blc * BLOCK_SIZE;
 
         
-        // for(int iter=0;(iter<100)&&(k_snew[0]>k_threshold[0]);iter++)
-        for (int iter = 1; (iter <= 100); iter++)
+        // for(int iter=0;(iter<max_iter)&&(k_snew[0]>k_threshold[0]);iter++)
+        for (int iter = 1; (iter <= max_iter); iter++)
         {
             if (threadIdx.x < WARP_PER_BLOCK)
             {
@@ -617,7 +619,8 @@ __global__ void stir_spmv_cuda_kernel_newcsr_nnz_balance_redce_block_shared_queu
                                                          int balance_row,
                                                          int *d_non_each_block_offset,
                                                          int *d_balance_tile_ptr_shared_end,
-                                                         int shared_num)
+                                                         int shared_num,
+                                                         int max_iter)
 {
     int global_id = blockIdx.x * blockDim.x + threadIdx.x;
     const int blki_blc = global_id >> 5;
@@ -685,8 +688,8 @@ __global__ void stir_spmv_cuda_kernel_newcsr_nnz_balance_redce_block_shared_queu
             __threadfence();
         } while (signal_final1[0] != shared_num);
         
-        // for(int iter=0;(iter<100)&&(k_snew[0]>k_threshold[0]);iter++)
-        for (int iter = 1; (iter <= 100); iter++)
+        // for(int iter=0;(iter<max_iter)&&(k_snew[0]>k_threshold[0]);iter++)
+        for (int iter = 1; (iter <= max_iter); iter++)
         {
             if (threadIdx.x < WARP_PER_BLOCK)
             {
@@ -907,7 +910,8 @@ __global__ void stir_spmv_cuda_kernel_newcsr_nnz_balance_shared_queue(int tilem,
                                                                       int *d_index_each_block,
                                                                       int balance_row,
                                                                       int *d_non_each_block_offset,
-                                                                      int *d_balance_tile_ptr_shared_end)
+                                                                      int *d_balance_tile_ptr_shared_end,
+                                                                      int max_iter)
 {
     int global_id = blockIdx.x * blockDim.x + threadIdx.x;
     const int blki_blc = global_id >> 5;
@@ -960,8 +964,8 @@ __global__ void stir_spmv_cuda_kernel_newcsr_nnz_balance_shared_queue(int tilem,
         }
         __syncthreads();
 
-        // for(int iter=0;(iter<100)&&(k_snew[0]>k_threshold[0]);iter++)
-        for (int iter = 0; (iter < 100); iter++)
+        // for(int iter=0;(iter<max_iter)&&(k_snew[0]>k_threshold[0]);iter++)
+        for (int iter = 0; (iter < max_iter); iter++)
         {
             if (threadIdx.x < WARP_PER_BLOCK)
             {
@@ -1141,7 +1145,8 @@ __forceinline__ __global__ void stir_spmv_cuda_kernel_newcsr_nnz_balance_below_t
                                                                                      int *d_index_each_block,
                                                                                      int balance_row,
                                                                                      int vector_each_warp,
-                                                                                     int vector_total)
+                                                                                     int vector_total,
+                                                                                     int max_iter)
 {
     int global_id = blockIdx.x * blockDim.x + threadIdx.x;
     const int blki_blc = global_id >> 5;
@@ -1179,8 +1184,8 @@ __forceinline__ __global__ void stir_spmv_cuda_kernel_newcsr_nnz_balance_below_t
         int offset=blki_blc * vector_each_warp;
         int iter;
         int u;
-        // for(int iter=1;(iter<=100)&&(k_snew[0]>k_threshold[0]);iter++)
-        for (iter = 1; (iter <= 100); iter++)
+        // for(int iter=1;(iter<=max_iter)&&(k_snew[0]>k_threshold[0]);iter++)
+        for (iter = 1; (iter <= max_iter); iter++)
         {
             if (threadIdx.x < WARP_PER_BLOCK)
             {
@@ -1381,7 +1386,8 @@ __forceinline__ __global__ void stir_spmv_cuda_kernel_newcsr_nnz_balance_below_t
                                                                                      int vector_each_warp,
                                                                                      int vector_total,
                                                                                      int *d_balance_tile_ptr_shared_end,
-                                                                                     int shared_num)
+                                                                                     int shared_num,
+                                                                                     int max_iter)
 {
     int global_id = blockIdx.x * blockDim.x + threadIdx.x;
     const int blki_blc = global_id >> 5;
@@ -1451,8 +1457,8 @@ __forceinline__ __global__ void stir_spmv_cuda_kernel_newcsr_nnz_balance_below_t
             __threadfence();
         } while (signal_final1[0] != shared_num);
 
-        // for(int iter=1;(iter<=100)&&(k_snew[0]>k_threshold[0]);iter++)
-        for (iter = 1; (iter <= 1000); iter++)
+        // for(int iter=1;(iter<=max_iter)&&(k_snew[0]>k_threshold[0]);iter++)
+        for (iter = 1; (iter <= max_iter); iter++)
         {
             if (threadIdx.x < WARP_PER_BLOCK)
             {

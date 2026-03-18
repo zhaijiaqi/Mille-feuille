@@ -1,9 +1,22 @@
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
 #include <sys/time.h>
 #include "./biio2.0/src/biio.h"
 #include "Mille-feuille-cg.h"
 
-extern "C" void cg_solve_reduce(int *RowPtr, int *ColIdx, MAT_VAL_TYPE *Val, MAT_VAL_LOW_TYPE *Val_Low, double *x, double *b, int n, int *iter, int maxiter, double threshold, char *filename, int nnzR, int ori)
+#define WARMUP 3
+#define BENCHMARK 10
+
+typedef struct {
+    double time_ms;
+    int iterations;
+    double l2_norm;
+    double residual;
+} CgBenchResult;
+
+extern "C" void cg_solve_reduce(int *RowPtr, int *ColIdx, MAT_VAL_TYPE *Val, MAT_VAL_LOW_TYPE *Val_Low, double *x, double *b, int n, int *iter, int maxiter, double threshold, char *filename, int nnzR, int ori, int max_iter, CgBenchResult *bench_result, int skip_output)
 {
     struct timeval t1, t2, t3, t4,t5,t6,t7,t8,t9,t10;
     int rowA = n;
@@ -242,7 +255,7 @@ extern "C" void cg_solve_reduce(int *RowPtr, int *ColIdx, MAT_VAL_TYPE *Val, MAT
     cudaMemcpy(d_tile_rowidx, tile_rowidx, sizeof(int) * (tilenum), cudaMemcpyHostToDevice);
     cudaDeviceSynchronize();
     gettimeofday(&t1, NULL);
-    while (iterations < 10000)
+    while (iterations < max_iter)
     //while (iterations < 1000 && sqrt(snew) > epsilon)
     {
         cudaMemset(k_q, 0, n * sizeof(double));
@@ -281,7 +294,13 @@ extern "C" void cg_solve_reduce(int *RowPtr, int *ColIdx, MAT_VAL_TYPE *Val, MAT
     cudaMemcpy(x, k_x, sizeof(double) * (n), cudaMemcpyDeviceToHost);
     gettimeofday(&t2, NULL);
     double time_cg = (t2.tv_sec - t1.tv_sec) * 1000.0 + (t2.tv_usec - t1.tv_usec) / 1000.0;
-    printf("time_cg=%lf ms\n",time_cg/100);
+    if (bench_result) {
+        bench_result->time_ms = time_cg;
+        bench_result->iterations = iterations;
+    }
+    if (!skip_output) {
+        printf("time_cg=%lf ms, iterations=%d\n", time_cg, iterations);
+    }
     double time_total = time_spmv + time_dot + time_axpy;
     double *b_new = (double *)malloc(sizeof(double) * n);
     memset(b_new, 0, sizeof(double) * n);
@@ -321,18 +340,25 @@ extern "C" void cg_solve_reduce(int *RowPtr, int *ColIdx, MAT_VAL_TYPE *Val, MAT
         sum_ori = sum_ori + (b[i] * b[i]);
     }
     double l2_norm = sqrt(sum) / sqrt(sum_ori);
-    char *s = (char *)malloc(sizeof(char) * 200);
-    sprintf(s, "%d,%.3f,%d,%e,%e\n", 100, time_cg/100, nnzR, l2_norm,sqrt(snew));
-    FILE *file1 = fopen("data/cg_performance.csv", "a");
-    if (file1 == NULL)
-    {
-        printf("open error!\n");
-        return;
+    if (bench_result) {
+        bench_result->l2_norm = l2_norm;
+        bench_result->residual = sqrt(snew);
     }
-    fwrite(filename, strlen(filename), 1, file1);
-    fwrite(",", strlen(","), 1, file1);
-    fwrite(s, strlen(s), 1, file1);
-    free(s);
+    if (!skip_output) {
+        char *s = (char *)malloc(sizeof(char) * 200);
+        sprintf(s, "%d,%.3f,%d,%e,%e\n", iterations, time_cg, nnzR, l2_norm, sqrt(snew));
+        FILE *file1 = fopen("cg_performance.csv", "a");
+        if (file1 == NULL)
+        {
+            printf("open error!\n");
+            return;
+        }
+        fwrite(filename, strlen(filename), 1, file1);
+        fwrite(",", strlen(","), 1, file1);
+        fwrite(s, strlen(s), 1, file1);
+        fclose(file1);
+        free(s);
+    }
     cudaFree(k_val);
     cudaFree(k_b);
     cudaFree(k_x);
@@ -376,7 +402,7 @@ extern "C" void cg_solve_reduce(int *RowPtr, int *ColIdx, MAT_VAL_TYPE *Val, MAT
 }
 
 
-extern "C" void cg_solve_sync(int *RowPtr, int *ColIdx, MAT_VAL_TYPE *Val, MAT_VAL_LOW_TYPE *Val_Low, double *x, double *b, int n, int *iter, int maxiter, double threshold, char *filename, int nnzR, int ori)
+extern "C" void cg_solve_sync(int *RowPtr, int *ColIdx, MAT_VAL_TYPE *Val, MAT_VAL_LOW_TYPE *Val_Low, double *x, double *b, int n, int *iter, int maxiter, double threshold, char *filename, int nnzR, int ori, int max_iter, CgBenchResult *bench_result, int skip_output)
 {
     struct timeval t1, t2, t3, t4, t5, t6;
     int rowA = n;
@@ -916,7 +942,7 @@ extern "C" void cg_solve_sync(int *RowPtr, int *ColIdx, MAT_VAL_TYPE *Val, MAT_V
                                                                                                              signal_dot, signal_final, signal_final1, d_ori_block_signal_new,
                                                                                                              k_alpha, k_snew, k_x_new, k_r_new, k_sold, k_beta, k_threshold,
                                                                                                              d_balance_tile_ptr_new, d_row_each_block, d_index_each_block, index,
-                                                                                                             vector_each_warp_32, vector_total_32);
+                                                                                                             vector_each_warp_32, vector_total_32, max_iter);
             cudaDeviceSynchronize();
             gettimeofday(&t4, NULL);
             time_spmv += (t4.tv_sec - t3.tv_sec) * 1000.0 + (t4.tv_usec - t3.tv_usec) / 1000.0;
@@ -954,7 +980,7 @@ extern "C" void cg_solve_sync(int *RowPtr, int *ColIdx, MAT_VAL_TYPE *Val, MAT_V
                                                                                               k_d_new, k_q_new, d_blockrowid_new, d_blockcsr_ptr_new, d_nonzero_row_new, d_Tile_csr_Col, d_block_signal_new,
                                                                                               signal_dot, signal_final, signal_final1, d_ori_block_signal_new,
                                                                                               k_alpha, k_snew, k_x_new, k_r_new, k_sold, k_beta, k_threshold,
-                                                                                              d_balance_tile_ptr_new, d_row_each_block, d_index_each_block, index);
+                                                                                              d_balance_tile_ptr_new, d_row_each_block, d_index_each_block, index, max_iter);
             cudaDeviceSynchronize();
             gettimeofday(&t4, NULL);
             time_spmv += (t4.tv_sec - t3.tv_sec) * 1000.0 + (t4.tv_usec - t3.tv_usec) / 1000.0;
@@ -974,7 +1000,13 @@ extern "C" void cg_solve_sync(int *RowPtr, int *ColIdx, MAT_VAL_TYPE *Val, MAT_V
     gettimeofday(&t2, NULL);
     cudaMemcpy(x, k_x_new, sizeof(double) * (n), cudaMemcpyDeviceToHost);
     double time_cg = (t2.tv_sec - t1.tv_sec) * 1000.0 + (t2.tv_usec - t1.tv_usec) / 1000.0;
-    printf("time_cg=%lf ms\n", time_spmv);
+    if (bench_result) {
+        bench_result->time_ms = time_cg;
+        bench_result->iterations = max_iter;
+    }
+    if (!skip_output) {
+        printf("time_cg=%lf ms, max_iter=%d\n", time_cg, max_iter);
+    }
     double *b_new = (double *)malloc(sizeof(double) * n);
     memset(b_new, 0, sizeof(double) * n);
     for (int blki = 0; blki < tilem; blki++)
@@ -1009,18 +1041,25 @@ extern "C" void cg_solve_sync(int *RowPtr, int *ColIdx, MAT_VAL_TYPE *Val, MAT_V
         sum_ori = sum_ori + (b[i] * b[i]);
     }
     double l2_norm = sqrt(sum) / sqrt(sum_ori);
-    char *s = (char *)malloc(sizeof(char) * 200);
-    sprintf(s, "%d,%.3f,%d,%e,%e\n", 100, time_cg, nnzR, l2_norm,sqrt(snew));
-    FILE *file1 = fopen("data/cg_performance.csv", "a");
-    if (file1 == NULL)
-    {
-        printf("open error!\n");
-        return;
+    if (bench_result) {
+        bench_result->l2_norm = l2_norm;
+        bench_result->residual = sqrt(snew);
     }
-    fwrite(filename, strlen(filename), 1, file1);
-    fwrite(",", strlen(","), 1, file1);
-    fwrite(s, strlen(s), 1, file1);
-    free(s);
+    if (!skip_output) {
+        char *s = (char *)malloc(sizeof(char) * 200);
+        sprintf(s, "%d,%.3f,%d,%e,%e\n", max_iter, time_cg, nnzR, l2_norm, sqrt(snew));
+        FILE *file1 = fopen("cg_performance.csv", "a");
+        if (file1 == NULL)
+        {
+            printf("open error!\n");
+            return;
+        }
+        fwrite(filename, strlen(filename), 1, file1);
+        fwrite(",", strlen(","), 1, file1);
+        fwrite(s, strlen(s), 1, file1);
+        fclose(file1);
+        free(s);
+    }
     cudaFree(k_val);
     cudaFree(k_b);
     cudaFree(k_x);
@@ -1068,7 +1107,7 @@ extern "C" void cg_solve_sync(int *RowPtr, int *ColIdx, MAT_VAL_TYPE *Val, MAT_V
     free(csr_compressedIdx);
     free(Blockcsr_Ptr);
 }
-extern "C" void cg_solve_inc(int *RowPtr, int *ColIdx, MAT_VAL_TYPE *Val, MAT_VAL_LOW_TYPE *Val_Low, double *x, double *b, int n, int *iter, int maxiter, double threshold, char *filename, int nnzR, int ori)
+extern "C" void cg_solve_inc(int *RowPtr, int *ColIdx, MAT_VAL_TYPE *Val, MAT_VAL_LOW_TYPE *Val_Low, double *x, double *b, int n, int *iter, int maxiter, double threshold, char *filename, int nnzR, int ori, int max_iter, CgBenchResult *bench_result, int skip_output)
 {
     struct timeval t1, t2, t3, t4, t5, t6;
     int rowA = n;
@@ -1513,7 +1552,7 @@ extern "C" void cg_solve_inc(int *RowPtr, int *ColIdx, MAT_VAL_TYPE *Val, MAT_VA
                                                                                                              signal_dot, signal_final, signal_final1, d_ori_block_signal,
                                                                                                              k_alpha, k_snew, k_x, k_r, k_sold, k_beta, k_threshold,
                                                                                                              d_balance_tile_ptr_new, d_row_each_block, d_index_each_block, index,
-                                                                                                             vector_each_warp_32, vector_total_32);
+                                                                                                             vector_each_warp_32, vector_total_32, max_iter);
 
         
         }
@@ -1528,7 +1567,7 @@ extern "C" void cg_solve_inc(int *RowPtr, int *ColIdx, MAT_VAL_TYPE *Val, MAT_VA
                                                                                               k_d, k_q, d_blockrowid_new, d_blockcsr_ptr_new, d_nonzero_row_new, d_Tile_csr_Col, d_block_signal,
                                                                                               signal_dot, signal_final, signal_final1, d_ori_block_signal,
                                                                                               k_alpha, k_snew, k_x, k_r, k_sold, k_beta, k_threshold,
-                                                                                              d_balance_tile_ptr_new, d_row_each_block, d_index_each_block, index);
+                                                                                              d_balance_tile_ptr_new, d_row_each_block, d_index_each_block, index, max_iter);
         }
         cudaDeviceSynchronize();
         gettimeofday(&t4, NULL);
@@ -1539,7 +1578,13 @@ extern "C" void cg_solve_inc(int *RowPtr, int *ColIdx, MAT_VAL_TYPE *Val, MAT_VA
     gettimeofday(&t2, NULL);
     cudaMemcpy(x, k_x, sizeof(double) * (n), cudaMemcpyDeviceToHost);
     double time_cg = (t2.tv_sec - t1.tv_sec) * 1000.0 + (t2.tv_usec - t1.tv_usec) / 1000.0;
-    printf("time_cg=%lf ms\n",time_spmv);
+    if (bench_result) {
+        bench_result->time_ms = time_cg;
+        bench_result->iterations = max_iter;
+    }
+    if (!skip_output) {
+        printf("time_cg=%lf ms, max_iter=%d\n", time_cg, max_iter);
+    }
     double *b_new = (double *)malloc(sizeof(double) * n);
     memset(b_new, 0, sizeof(double) * n);
     for (int blki = 0; blki < tilem; blki++)
@@ -1574,18 +1619,25 @@ extern "C" void cg_solve_inc(int *RowPtr, int *ColIdx, MAT_VAL_TYPE *Val, MAT_VA
         sum_ori = sum_ori + (b[i] * b[i]);
     }
     double l2_norm = sqrt(sum) / sqrt(sum_ori);
-    char *s = (char *)malloc(sizeof(char) * 200);
-    sprintf(s, "%d,%.3f,%d,%e,%e\n", 100, time_cg, nnzR, l2_norm,sqrt(snew));
-    FILE *file1 = fopen("data/cg_performance.csv", "a");
-    if (file1 == NULL)
-    {
-        printf("open error!\n");
-        return;
+    if (bench_result) {
+        bench_result->l2_norm = l2_norm;
+        bench_result->residual = sqrt(snew);
     }
-    fwrite(filename, strlen(filename), 1, file1);
-    fwrite(",", strlen(","), 1, file1);
-    fwrite(s, strlen(s), 1, file1);
-    free(s);
+    if (!skip_output) {
+        char *s = (char *)malloc(sizeof(char) * 200);
+        sprintf(s, "%d,%.3f,%d,%e,%e\n", max_iter, time_cg, nnzR, l2_norm, sqrt(snew));
+        FILE *file1 = fopen("cg_performance.csv", "a");
+        if (file1 == NULL)
+        {
+            printf("open error!\n");
+            return;
+        }
+        fwrite(filename, strlen(filename), 1, file1);
+        fwrite(",", strlen(","), 1, file1);
+        fwrite(s, strlen(s), 1, file1);
+        fclose(file1);
+        free(s);
+    }
     cudaFree(k_val);
     cudaFree(k_b);
     cudaFree(k_x);
@@ -1630,6 +1682,8 @@ extern "C" void cg_solve_inc(int *RowPtr, int *ColIdx, MAT_VAL_TYPE *Val, MAT_VA
 int main(int argc, char **argv)
 {
     char *filename = argv[1];
+    char *max_iter_str = argv[2];
+    int max_iter = atoi(max_iter_str);
     int m, n, nnzR, isSymmetric;
     int *RowPtr;
     int *ColIdx;
@@ -1640,6 +1694,7 @@ int main(int argc, char **argv)
         printf("unequal\n");
         return 0;
     }
+    printf("矩阵规模Row=%d,Col=%d,NNZ=%d\n",m,n,nnzR);
     MAT_VAL_LOW_TYPE *Val_Low = (MAT_VAL_LOW_TYPE *)malloc(sizeof(MAT_VAL_LOW_TYPE) * nnzR);
     for (int i = 0; i < nnzR; i++)
     {
@@ -1664,10 +1719,47 @@ int main(int argc, char **argv)
         for (int j = RowPtr[i]; j < RowPtr[i + 1]; j++)
             Y_golden[i] += Val[j] * X[ColIdx[j]];
 
-    if(nnzR<10000)
-    cg_solve_inc(RowPtr, ColIdx, Val, Val_Low, X, Y_golden, n, &iter, 10, 1e-5, filename, nnzR, ori);
-    else if(nnzR<100000&&nnzR>=10000)
-    cg_solve_sync(RowPtr, ColIdx, Val, Val_Low, X, Y_golden, n, &iter, 10, 1e-5, filename, nnzR, ori);
-    else if(nnzR>=100000)
-    cg_solve_reduce(RowPtr, ColIdx, Val, Val_Low, X, Y_golden, n, &iter, 10, 1e-5, filename, nnzR, ori);
+    CgBenchResult result;
+    double times[BENCHMARK];
+    double time_avg = 0;
+
+    /* warmup */
+    for (int i = 0; i < WARMUP; i++) {
+        if (nnzR < 10000)
+            cg_solve_inc(RowPtr, ColIdx, Val, Val_Low, X, Y_golden, n, &iter, 10, 1e-5, filename, nnzR, ori, max_iter, NULL, 1);
+        else if (nnzR < 100000 && nnzR >= 10000)
+            cg_solve_sync(RowPtr, ColIdx, Val, Val_Low, X, Y_golden, n, &iter, 10, 1e-5, filename, nnzR, ori, max_iter, NULL, 1);
+        else if (nnzR >= 100000)
+            cg_solve_reduce(RowPtr, ColIdx, Val, Val_Low, X, Y_golden, n, &iter, 10, 1e-5, filename, nnzR, ori, max_iter, NULL, 1);
+    }
+
+    /* benchmark */
+    for (int i = 0; i < BENCHMARK; i++) {
+        if (nnzR < 10000)
+            cg_solve_inc(RowPtr, ColIdx, Val, Val_Low, X, Y_golden, n, &iter, 10, 1e-5, filename, nnzR, ori, max_iter, &result, 1);
+        else if (nnzR < 100000 && nnzR >= 10000)
+            cg_solve_sync(RowPtr, ColIdx, Val, Val_Low, X, Y_golden, n, &iter, 10, 1e-5, filename, nnzR, ori, max_iter, &result, 1);
+        else if (nnzR >= 100000)
+            cg_solve_reduce(RowPtr, ColIdx, Val, Val_Low, X, Y_golden, n, &iter, 10, 1e-5, filename, nnzR, ori, max_iter, &result, 1);
+        times[i] = result.time_ms;
+    }
+
+    for (int i = 0; i < BENCHMARK; i++)
+        time_avg += times[i];
+    time_avg /= BENCHMARK;
+
+    printf("time_cg_avg=%.3f ms (warmup=%d, benchmark=%d)\n", time_avg, WARMUP, BENCHMARK);
+
+    const char *out_csv = (argc >= 4) ? argv[3] : "cg_performance.csv";
+    const char *variant = "cg";
+
+    FILE *file1 = fopen(out_csv, "a");
+    if (file1 != NULL) {
+        long pos = ftell(file1);
+        if (pos == 0) {
+            fprintf(file1, "matrix,variant,iterations,time_ms,nnz,l2_norm,residual\n");
+        }
+        fprintf(file1, "%s,%s,%d,%.3f,%d,%e,%e\n", filename, variant, result.iterations, time_avg, nnzR, result.l2_norm, result.residual);
+        fclose(file1);
+    }
 }
