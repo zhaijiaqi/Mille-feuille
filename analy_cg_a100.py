@@ -1,3 +1,13 @@
+# 这段代码读取 cg_AD_new.csv、cg_cusparse_a100.csv、ginkgo_cg_a100.csv、petsc_cg_a100.csv、mat2757new.csv等文件，
+# 处理数据并生成 cg_solver_a100.csv和cg_petsc_ginkgo.csv两个输出文件。
+# 主要功能包括：
+# 1. 读取同步Free CG方法的性能数据
+# 2. 读取cusparse的性能数据
+# 3. 读取Ginkgo的性能数据
+# 4. 读取PETSc的性能数据
+# 5. 读取矩阵大小信息
+# 6. 合并数据并计算性能指标
+# 7. 生成最终的CG求解器性能报告
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd

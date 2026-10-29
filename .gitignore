@@ -3,4 +3,7 @@
 *.zip
 /petsc-main/
 /ginkgo-develop/
+.cache/
+.vscode/
+compile_commands.json
 

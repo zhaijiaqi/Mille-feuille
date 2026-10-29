@@ -1,4 +1,9 @@
 id,Group,Name,rows,cols,entries
+843,Cunningham,m3plates,11107,11107,6639
+445,Garon,garon2,13535,13535,373235
+970,Schenk_ISEI,nmos3,18588,18588,237130
+1417,Sandia,ASIC_320k,321821,321821,1931828
+347,Boeing,bcsstm37,25503,25503,15525
 2,HB,494_bus,494,494,1666
 877,Pothen,mesh3e1,289,289,1889
 878,Pothen,mesh3em5,289,289,1889

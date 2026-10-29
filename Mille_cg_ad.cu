@@ -5978,6 +5978,7 @@ int main(int argc, char **argv)
     memset(Y, 0, sizeof(MAT_VAL_TYPE) * (n));
     memset(Y_golden, 0, sizeof(MAT_VAL_TYPE) * (n));
 
+    // 初始点为 X = [1, 1, ..., 1]
     for (int i = 0; i < n; i++)
     {
         X[i] = 1;

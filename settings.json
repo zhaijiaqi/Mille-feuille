@@ -1,0 +1,24 @@
+{
+    "clangd.arguments": [
+      // 在后台持续索引代码，提高后续跳转和补全的速度
+      // 特别适合大型项目，可以在你编码时建立索引
+      "--background-index",
+
+      // 指定compile_commands.json的查找目录
+      // ${workspaceFolder}是VSCode的工作区目录变量
+      "--compile-commands-dir=${workspaceFolder}",
+
+      // 代码补全时显示详细信息
+      // 会显示函数的完整签名、参数类型、返回值等
+      "--completion-style=detailed",
+
+      // 自动插入头文件的策略，使用"include what you use"规则
+      // 只包含直接使用的头文件，减少不必要的包含
+      "--header-insertion=iwyu",
+
+      // 预编译头文件存储在内存中
+      // 提高性能，但会占用更多内存
+      "--pch-storage=memory",
+
+    ]
+}

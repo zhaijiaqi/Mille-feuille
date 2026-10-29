@@ -14,6 +14,12 @@ with open(filename) as csvfile:
         cur_row = next(csv_reader)
         matrix_group = "MM/" + cur_row[1]
         matrix_name = cur_row[2]
+        matrix_path_in_matrix_folder = os.path.join("./matrix", matrix_name + ".mtx")
+        # 先判断./matrix文件夹下是否已有该矩阵
+        if os.path.exists(matrix_path_in_matrix_folder):
+            print(f"--- Matrix {matrix_name} already exists in ./matrix folder ---")
+            continue
+        # 再判断MM下的结构是否存在（维持原有逻辑，防止再次下载）
         if os.path.exists(matrix_group + "/" + matrix_name + "/" + matrix_name + ".mtx") == False:
             matrix_url = "http://sparse-files.engr.tamu.edu/MM/" + cur_row[1] + "/" + cur_row[2] + ".tar.gz"
             os.system("wget " + matrix_url)
